@@ -2,43 +2,6 @@ name: Hourly Sync
 
 on:
   schedule:
-    # ONE hourly window for BOTH pipelines (§T131). The guild sync keeps its
-    # historical `:45` slot — `GUILD_SYNC_MINUTE` and every ":45" sentence on the
-    # site are unchanged — and the player sync, which used to have a `:15` cron of
-    # its own, now runs in the same round right after it.
-    #
-    # Two reasons the pipelines were merged, both measured:
-    #  - WCL 429s. The point window is NOT clock-aligned (observed resets at
-    #    20:00:00 · 00:00:38 · 16:11:26 · 05:15:25 · 06:15:32 — the anchor drifts,
-    #    as if a 60-min window opens on the first request after the previous one
-    #    expired), so a `:15` player run that slept past a reset could share ONE
-    #    window with TWO jitter-delayed `:45` guild runs: 13% of guild-sync runs
-    #    429'd, 54% of the ones that started while a player sync was in flight
-    #    against 7% otherwise, and the 06:0xZ mop leg failed five days running.
-    #    Running them in a fixed order in one window makes the spend sequential,
-    #    and the player leg's stop-at-cap (`PLAYER_SYNC_INCREMENTAL_STOP_POINTS`)
-    #    leaves a whole further guild run's worth of points inside the window.
-    #  - Neon CU-hours. Each pipeline woke the database and held it awake through
-    #    its own 5-minute suspend tail; two windows an hour ~30 min apart meant the
-    #    compute effectively never slept. One window is one wake.
-    #
-    # TWO expressions that PARTITION the 24 hours: every hour syncs, and only the
-    # 02:45 one also rebuilds the public players boards (§T121 — those six routes
-    # are the heaviest HTML the site serves, and re-storing them hourly is what put
-    # the ISR-write meter over its cap; 02 UTC is the quietest hour for a Polish
-    # audience, so the rebuild lands before the day starts).
-    #
-    # The split is what makes that gate work AT ALL (§T129). It used to be one
-    # hourly cron plus a wall-clock UTC-hour test in the plan job — but GitHub
-    # delays the cron so routinely that across 60 consecutive runs NOT ONE started
-    # inside its nominal hour, so the daily refresh had never fired since §T121
-    # shipped and the boards rode their 24h TTL alone. `github.event.schedule` is
-    # the expression that TRIGGERED the run, reported whatever time GitHub gets
-    # around to starting it, so a late run still refreshes.
-    #
-    # Keep the two hour fields disjoint AND exhaustive — a unit guard expands them
-    # and fails on either mistake: an overlap double-fires a sync at that hour, a
-    # hole leaves an hour unsynced.
     - cron: '45 0-1,3-23 * * *'
     - cron: '45 2 * * *'
   workflow_dispatch:
@@ -68,28 +31,6 @@ on:
           - incremental
           - full
 
-# NO workflow-level `concurrency` group, deliberately (§T131): the two pipelines
-# hold their OWN job-level groups instead (`hourly-sync-guild`,
-# `hourly-sync-player`), so two guild jobs never overlap and two player jobs never
-# overlap, while a dispatched hours-long `--full` player sweep can never hold up
-# the next hour's guild sync — the guild ladders are the product, and they are
-# what the site's five ranking routes and the Discord announcements are built on.
-#
-# Both groups carry `queue: max`, and that is load-bearing rather than tidy. A
-# job-level group is evaluated PER MATRIX LEG, and the default `queue: single`
-# keeps at most ONE pending entry per group, cancelling it as soon as the next one
-# queues: with three tiers sharing one group, the retail leg would run, tbc would
-# pend, and mop queueing would CANCEL tbc — that tier's whole chain (sync →
-# notifier → revalidate) silently skipped for the hour, with the run reported
-# "cancelled" rather than "failed". The same holds across runs under the cron's
-# ~20-minute jitter. `queue: max` lets up to 100 entries wait FIFO instead, and is
-# explicitly compatible with `cancel-in-progress: false` (the combination it
-# rejects is `queue: max` + `cancel-in-progress: true`).
-#
-# One consequence, chosen rather than discovered: during a dispatched full sweep
-# the next hour's guild job overlaps it. That is exactly today's 429 exposure, it
-# is dispatch-only, and the sweep paces itself past every reset, so it yields the
-# pool rather than racing for it.
 
 jobs:
   plan:
@@ -104,12 +45,6 @@ jobs:
       mode: ${{ steps.plan.outputs.mode }}
       revalidate_players: ${{ steps.plan.outputs.revalidate_players }}
     steps:
-      # The trigger decides WHICH pipelines run, WHICH tiers, and in WHICH mode:
-      # a schedule fans both pipelines out to all three tiers incrementally, and
-      # `--full` is reachable only by dispatch (§T100/D51). Event values are
-      # passed through `env` rather than interpolated into the script body (they
-      # are workflow-controlled and the dispatch inputs are `choice`-constrained,
-      # but this keeps the shell free of expression expansion).
       - name: Resolve schedule / dispatch to pipelines + tiers + mode
         id: plan
         env:
@@ -118,9 +53,6 @@ jobs:
           INPUT_PIPELINES: ${{ inputs.pipelines }}
           INPUT_TIER: ${{ inputs.tier }}
           INPUT_MODE: ${{ inputs.mode }}
-          # The §T131 runway lever: a non-secret repository variable, read HERE
-          # and nowhere else (no script and no service knows it exists). Unset =
-          # not paused.
           PLAYER_PIPELINE_PAUSED: ${{ vars.PLAYER_PIPELINE_PAUSED }}
         run: |
           set -euo pipefail
@@ -132,29 +64,15 @@ jobs:
               pipelines="$INPUT_PIPELINES"
               tier="$INPUT_TIER"
               mode="$INPUT_MODE"
-              # A dispatch is a bootstrap or an incident response — whoever
-              # pressed it is waiting to SEE the result, so it always refreshes,
-              # and it ignores the pause variable outright (pressing the button
-              # is the explicit act the pause exists to leave available).
               revalidate_players='true'
               ;;
             schedule)
               pipelines='both'
-              # WHICH expression fired decides all three answers, the board
-              # refresh included — never the clock, which GitHub's start delay
-              # makes meaningless here (see the `on.schedule` note). The patterns
-              # must stay LITERAL: they contain `*`, so a variable pattern would
-              # glob and match the wrong branch.
               case "$SCHEDULE" in
                 '45 0-1,3-23 * * *') tier='all'; mode='incremental'; revalidate_players='false' ;;
                 '45 2 * * *') tier='all'; mode='incremental'; revalidate_players='true' ;;
                 *) echo "::error::Unmapped schedule '$SCHEDULE'"; exit 1 ;;
               esac
-              # The pause is SCHEDULED-runs-only, and it drops the player half of
-              # the round while the guild ladders — the product — keep running.
-              # Its reason to exist is a metered month-end (Neon CU-hours, Vercel
-              # ISR writes) or an incident; flipping a repository variable needs
-              # no deploy and no edit here.
               if [ "${PLAYER_PIPELINE_PAUSED:-}" = 'true' ]; then
                 pipelines='guild'
                 paused='true'
@@ -163,9 +81,6 @@ jobs:
             *) echo "::error::Unsupported event '$EVENT_NAME'"; exit 1 ;;
           esac
 
-          # Symmetric with the tier guard below: unreachable while both dispatch
-          # inputs are `choice`-constrained, but an unknown mode must fail loudly
-          # rather than silently fall through to the incremental branch.
           case "$mode" in
             incremental|full) ;;
             *) echo "::error::Unknown mode '$mode'"; exit 1 ;;
@@ -178,21 +93,10 @@ jobs:
             *) echo "::error::Unknown pipelines '$pipelines'"; exit 1 ;;
           esac
 
-          # The guild matrix carries each tier's own revalidate paths. Retail's
-          # `speed_path` is deliberately EMPTY — it publishes no speed page — and
-          # the revalidate loop skips an empty path rather than POSTing one.
           guild_retail='{"tier":"retail","path":"/","speed_path":""}'
           guild_tbc='{"tier":"tbc","path":"/tbc","speed_path":"/tbc/speed"}'
           guild_mop='{"tier":"mop","path":"/mop","speed_path":"/mop/speed"}'
 
-          # Each tier's players paths MIRROR `PLAYERS_ROUTE_BY_TIER` and
-          # `PLAYERS_KLASY_ROUTE_BY_TIER` in
-          # utils/services/playerRankingsService.ts — those maps are the single
-          # source of truth for the players routes (the role board and its
-          # §T104/D59 "Klasy" twin, both fed by THIS sync), and a unit drift
-          # guard (playerRankingsService.test.ts) parses these three lines and
-          # fails the build if the two ever disagree. The mode/schedule mapping
-          # above has its own guard in playerRankingsSyncService.test.ts.
           retail='{"tier":"retail","players_path":"/players","players_klasy_path":"/players/class"}'
           tbc='{"tier":"tbc","players_path":"/tbc/players","players_klasy_path":"/tbc/players/class"}'
           mop='{"tier":"mop","players_path":"/mop/players","players_klasy_path":"/mop/players/class"}'
@@ -225,22 +129,12 @@ jobs:
     if: needs.plan.outputs.run_guild == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Job-level, not workflow-level (see the note above `jobs:`): two guild runs
-    # must never overlap — they share one WCL OAuth token and one point pool —
-    # but a long player job must never queue behind, or hold up, this one.
-    # `queue: max` because this group is evaluated per MATRIX LEG: under the
-    # default `single` a third tier queueing would cancel the second one outright,
-    # skipping that tier's sync + notifier + revalidate for the hour (see the note
-    # above `jobs:`). Waiting legs now queue FIFO and nothing pending is dropped.
     concurrency:
       group: hourly-sync-guild
       queue: max
       cancel-in-progress: false
     strategy:
       fail-fast: false
-      # One tier at a time: the sync is pure GraphQL, but every tier shares one
-      # WCL OAuth token and the same hourly GraphQL point budget, so serializing
-      # keeps parallel tiers from racing each other into the rate limit.
       max-parallel: 1
       matrix:
         include: ${{ fromJson(needs.plan.outputs.guild_matrix) }}
@@ -252,12 +146,8 @@ jobs:
       SECONDARY_RANKING_ZONE_ID: ${{ vars.SECONDARY_RANKING_ZONE_ID }}
       DOMAIN_URL: ${{ vars.DOMAIN_URL }}
       SUBMITION_API_KEY: ${{ secrets.SUBMITION_API_KEY }}
-      # Bot token for the hourly kill-announcement fan-out (notify:rank-changes).
-      # Lived only in Vercel before §T70 — HUMAN OP: add it to GH Actions secrets.
       DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
     steps:
-      # This workflow lives in the public runner repo; the code does not.
-      # `CODE_REPO_KEY` is a read-only deploy key on the code repo.
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -265,11 +155,6 @@ jobs:
           ssh-key: ${{ secrets.CODE_REPO_KEY }}
           fetch-depth: 1
 
-      # package.json pins yarn@3.8.7 (Berry — the version that wrote
-      # yarn.lock). The runner's global yarn 1.22.x refuses to run against
-      # that pin, and before the pin existed it silently fresh-resolved every
-      # range instead of reading the Berry lockfile. The shim must be live
-      # BEFORE setup-node so its yarn cache detection runs Berry too.
       - name: Enable Corepack
         run: corepack enable
 
@@ -304,62 +189,19 @@ jobs:
       - name: Sync guild rankings
         run: yarn sync:guild-rankings --tier ${{ matrix.tier }}
 
-      # Runs BEFORE the revalidation below since §T130, which deleted the second
-      # (pre-notifier) revalidate loop this step used to sit between. §T70 wanted
-      # subscribers to land on already-fresh pages, and the trailing step serves
-      # that BETTER than the deleted one did: only a revalidation taken after the
-      # notifier carries the events the announcement is about. Discord transport
-      # failures are swallowed by the service (403/404 self-prune, 429 retried
-      # once, others logged), so only a genuine DB/data error fails the step — and
-      # that now skips the refresh below with it, leaving this tier's boards up to
-      # an hour stale until the next run heals them. Accepted: the run is red
-      # either way, the blast radius equals any earlier step failing, and a
-      # condition that fires after a failed step is its own trap.
       - name: Announce rank changes to Discord subscribers
         if: success()
         run: yarn notify:rank-changes --tier ${{ matrix.tier }}
 
-      # THE revalidation — one per path per run (§T130). It was two: this step and
-      # a pre-notifier twin, each POSTing and warming every path, so every board
-      # regenerated TWICE an hour. Vercel content-dedups (an unchanged
-      # regeneration writes 3 ISR units, a changed one 36) and each regeneration
-      # also rewrites the Next-16 segment-cache entries, so the pair cost ~1,435
-      # write units per 12 h across the five guild boards — 46 writes per board
-      # per 12 h where 23 buy the identical page.
-      #
-      # This is the one that had to survive: the notifier persists this run's kill
-      # and speed-record events, and since the §T86 follow-up EACH TIER's activity
-      # feed is baked into that tier's OWN ranking routes (progress + speed) at
-      # render time — so a revalidation taken before it would serve a page missing
-      # exactly the news the run just made. The cost is the few seconds between
-      # the Discord announcement and the warm GET, in which a subscriber who
-      # clicks instantly is served the stale entry while it regenerates behind
-      # them.
       - name: Revalidate and warm this tier's boards
         if: success()
         run: |
-          # Ceiling on a warm-up GET, not an expectation: a cold board
-          # regeneration measured 2.64 s, and a warm-up that somehow hangs is
-          # abandoned rather than allowed to stretch this step (§T116).
           WARM_TIMEOUT_SECONDS=60
           for path in "${{ matrix.path }}" "${{ matrix.speed_path }}"; do
             if [ -z "$path" ]; then continue; fi
             curl -X POST "${{ env.DOMAIN_URL }}/api/revalidate?path=${path}" \
               -H "x-api-key: ${{ env.SUBMITION_API_KEY }}" \
               -f
-            # `revalidatePath` only MARKS the entry stale, so whoever requests
-            # the path next pays the regeneration — measured 2.64 s, hourly, on
-            # every board route, always to a real visitor. This GET makes the
-            # RUNNER that next request. ONE per path is enough: the regenerated
-            # entry lands in the deployment's shared ISR store, and other PoPs
-            # then serve HIT/STALE from it.
-            #
-            # Best-effort BY CONSTRUCTION — a warm cache is an optimisation, a
-            # failed sync is an incident: no `-f`, an explicit `--max-time`, and
-            # the exit code neutralised, so nothing here can fail the step under
-            # the runner's `bash -e`. Losing a warm-up costs exactly today's
-            # behaviour: the next reader pays the render, as they always have.
-            # No API key — this is a plain public page request.
             curl -sS -o /dev/null --max-time "$WARM_TIMEOUT_SECONDS" \
               -w "Warmed ${path} -> HTTP %{http_code} in %{time_total}s\n" \
               "${{ env.DOMAIN_URL }}${path}" \
@@ -368,56 +210,16 @@ jobs:
 
   player:
     name: Player Sync (${{ matrix.tier }})
-    # SECOND in the round, and second on purpose: the guild ladders are the
-    # product, so they get the fresh window, and the player leg then stops at
-    # `PLAYER_SYNC_INCREMENTAL_STOP_POINTS` — leaving room in the SAME window for
-    # one more guild run, since WCL's window is not clock-aligned.
-    #
-    # `always()` is load-bearing: a red, cancelled or SKIPPED guild job must never
-    # take the player sync down with it. `needs:` alone would skip this job in all
-    # three cases, and a `pipelines: player` dispatch skips the guild job by
-    # design. What still gates it is the PLAN job — an unresolvable trigger must
-    # stop the whole round rather than run half of it on guessed inputs. (The
-    # reverse ordering hazard cannot arise: nothing here runs before the guild
-    # job has finished one way or another.)
     needs: [plan, guild]
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.run_player == 'true'
     runs-on: ubuntu-latest
-    # A DISPATCHED full sweep re-reads a zone's whole report history and refetches
-    # every character's boards (≈4–15k points) while pacing itself past the hourly
-    # point resets, so it runs for hours by design — the eu-guild-sync precedent.
-    # An hourly incremental pass finishes in minutes, and since §T131 it STOPS at
-    # its point cap rather than sleeping past a reset, so it can no longer stretch
-    # into the next hour at all.
-    #
-    # This is an honest CEILING, not a budget: 350 min sits just under GitHub's
-    # 6h hosted-runner limit, while a ~15k-point sweep paced at
-    # PLAYER_SYNC_SOFT_POINT_CAP = 2500/hr (a pool shared with the hourly guild
-    # sync's ~1,280) needs roughly 6–10h — so the retail bootstrap full sweep will
-    # likely be cut off here and need repeated dispatches. That is survivable
-    # because a sweep is RESUMABLE: everything already written stays, and every
-    # character it never answered for keeps a missing-or-stale
-    # `CharacterBoardFetch` row, so the hourly incremental runs pick the remainder
-    # up on their own (§T100/D52-D53), with stage 3 re-deriving the dense ranks
-    # from whatever is stored.
     timeout-minutes: 350
-    # Job-level, for the same reason the guild job has one: two player syncs would
-    # double-spend the shared WCL pool and interleave the stage-3 dense-rank
-    # rewrites, so runs QUEUE instead of overlapping — `cancel-in-progress: false`,
-    # an expensive dispatched sweep is never killed. `queue: max` for the guild
-    # job's reason (the group is per matrix LEG, and `single` would cancel a
-    # pending tier the moment the next one queued); up to 100 entries then wait
-    # FIFO, so a backlog of hourly crons behind a paced sweep drains in order
-    # instead of losing whole tiers.
     concurrency:
       group: hourly-sync-player
       queue: max
       cancel-in-progress: false
     strategy:
       fail-fast: false
-      # One tier at a time: the tiers share ONE WCL point pool with the guild sync
-      # that has just run, so parallel legs would race each other (and production)
-      # into the rate limit — the guild-sync rule (D27).
       max-parallel: 1
       matrix:
         include: ${{ fromJson(needs.plan.outputs.player_matrix) }}
@@ -425,16 +227,11 @@ jobs:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       WARCRAFT_LOGS_CLIENT_ID: ${{ vars.WARCRAFT_LOGS_CLIENT_ID }}
       WARCRAFT_LOGS_CLIENT_SECRET: ${{ secrets.WARCRAFT_LOGS_CLIENT_SECRET }}
-      # Only the MoP tier's zone ids come from env (TBC/Retail are fixed in the
-      # registry), but the registry builds every tier eagerly — so every leg
-      # needs them set.
       PRIMARY_RANKING_ZONE_ID: ${{ vars.PRIMARY_RANKING_ZONE_ID }}
       SECONDARY_RANKING_ZONE_ID: ${{ vars.SECONDARY_RANKING_ZONE_ID }}
       DOMAIN_URL: ${{ vars.DOMAIN_URL }}
       SUBMITION_API_KEY: ${{ secrets.SUBMITION_API_KEY }}
     steps:
-      # This workflow lives in the public runner repo; the code does not.
-      # `CODE_REPO_KEY` is a read-only deploy key on the code repo.
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -442,11 +239,6 @@ jobs:
           ssh-key: ${{ secrets.CODE_REPO_KEY }}
           fetch-depth: 1
 
-      # package.json pins yarn@3.8.7 (Berry — the version that wrote
-      # yarn.lock). The runner's global yarn 1.22.x refuses to run against
-      # that pin, and before the pin existed it silently fresh-resolved every
-      # range instead of reading the Berry lockfile. The shim must be live
-      # BEFORE setup-node so its yarn cache detection runs Berry too.
       - name: Enable Corepack
         run: corepack enable
 
@@ -484,44 +276,17 @@ jobs:
           fi
 
       - name: Trigger cache revalidation
-        # Gated to ONE run a day by the plan job (§T121); a dispatch always
-        # passes. Everything above this line still runs every hour — the DB, the
-        # fetch queue and the weekly baselines are untouched by the gate, and
-        # only the public page rebuild is rationed.
         if: success() && needs.plan.outputs.revalidate_players == 'true'
-        # BOTH views of the tier's player data are ISR routes fed by this one
-        # sync (§T104/D59), so both are refreshed — leaving the "Klasy" twin out
-        # would let it sit a whole day behind the role board it re-groups.
         env:
           PLAYERS_PATH: ${{ matrix.players_path }}
           PLAYERS_KLASY_PATH: ${{ matrix.players_klasy_path }}
         run: |
           set -euo pipefail
-          # Ceiling on a warm-up GET, not an expectation: a cold board
-          # regeneration measured 2.64 s, and a warm-up that somehow hangs is
-          # abandoned rather than allowed to stretch this step (§T116).
           WARM_TIMEOUT_SECONDS=60
           for path in "$PLAYERS_PATH" "$PLAYERS_KLASY_PATH"; do
             curl -X POST "${{ env.DOMAIN_URL }}/api/revalidate?path=$path" \
               -H "x-api-key: ${{ env.SUBMITION_API_KEY }}" \
               -f
-            # `revalidatePath` only MARKS the entry stale, so whoever requests
-            # the path next pays the regeneration (measured 2.64 s on a board) —
-            # on both views, and otherwise always a real visitor. This GET makes
-            # the RUNNER that next request, which matters MORE now that the step
-            # runs once a day: the entry it warms is the one every reader of the
-            # next 24 hours is served. ONE per path is enough — the regenerated
-            # entry lands in the deployment's shared ISR store, and other PoPs
-            # then serve HIT/STALE from it.
-            #
-            # Best-effort BY CONSTRUCTION — a warm cache is an optimisation, a
-            # failed sync is an incident: no `-f`, an explicit `--max-time`, and
-            # the exit code neutralised, so nothing here can fail the step under
-            # this block's `set -e`. Losing a warm-up costs exactly today's
-            # behaviour: the next reader pays the render, as they always have.
-            # No API key — this is a plain public page request. (While
-            # PLAYERS_UI_ENABLED is off these routes 404, which is the same
-            # no-op the revalidate above already is.)
             curl -sS -o /dev/null --max-time "$WARM_TIMEOUT_SECONDS" \
               -w "Warmed $path -> HTTP %{http_code} in %{time_total}s\n" \
               "${{ env.DOMAIN_URL }}$path" \
