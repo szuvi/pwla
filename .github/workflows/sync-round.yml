@@ -1,13 +1,19 @@
-name: Hourly Sync
+name: Sync Round
+
 
 on:
-  schedule:
-    - cron: '45 0-1,3-23 * * *'
-    - cron: '45 2 * * *'
   workflow_dispatch:
     inputs:
+      scheduled:
+        description: 'Set by the external clock: the standard all-tier incremental round (honours PLAYER_PIPELINE_PAUSED; ignores pipelines / tier / mode)'
+        type: boolean
+        default: false
+      revalidate_players:
+        description: 'Rebuild the six players boards after the player sync (the clock passes true on its 2:00 slot only)'
+        type: boolean
+        default: true
       pipelines:
-        description: 'Which pipelines to run (scheduled runs always do both)'
+        description: 'Which pipelines to run (a clock round always does both)'
         type: choice
         default: both
         options:
@@ -15,7 +21,7 @@ on:
           - guild
           - player
       tier:
-        description: 'Tier to sync ("all" = the hourly fan-out) — applies to both pipelines'
+        description: 'Tier to sync ("all" = the full fan-out) — applies to both pipelines'
         type: choice
         default: all
         options:
@@ -45,11 +51,12 @@ jobs:
       mode: ${{ steps.plan.outputs.mode }}
       revalidate_players: ${{ steps.plan.outputs.revalidate_players }}
     steps:
-      - name: Resolve schedule / dispatch to pipelines + tiers + mode
+      - name: Resolve the dispatch inputs to pipelines + tiers + mode
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
-          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_SCHEDULED: ${{ inputs.scheduled }}
+          INPUT_REVALIDATE_PLAYERS: ${{ inputs.revalidate_players }}
           INPUT_PIPELINES: ${{ inputs.pipelines }}
           INPUT_TIER: ${{ inputs.tier }}
           INPUT_MODE: ${{ inputs.mode }}
@@ -60,25 +67,32 @@ jobs:
           paused='false'
 
           case "$EVENT_NAME" in
-            workflow_dispatch)
-              pipelines="$INPUT_PIPELINES"
-              tier="$INPUT_TIER"
-              mode="$INPUT_MODE"
-              revalidate_players='true'
-              ;;
-            schedule)
+            workflow_dispatch) ;;
+            *) echo "::error::Unsupported event '$EVENT_NAME'"; exit 1 ;;
+          esac
+
+          case "$INPUT_SCHEDULED" in
+            true)
               pipelines='both'
-              case "$SCHEDULE" in
-                '45 0-1,3-23 * * *') tier='all'; mode='incremental'; revalidate_players='false' ;;
-                '45 2 * * *') tier='all'; mode='incremental'; revalidate_players='true' ;;
-                *) echo "::error::Unmapped schedule '$SCHEDULE'"; exit 1 ;;
-              esac
+              tier='all'
+              mode='incremental'
               if [ "${PLAYER_PIPELINE_PAUSED:-}" = 'true' ]; then
                 pipelines='guild'
                 paused='true'
               fi
               ;;
-            *) echo "::error::Unsupported event '$EVENT_NAME'"; exit 1 ;;
+            false|'')
+              pipelines="$INPUT_PIPELINES"
+              tier="$INPUT_TIER"
+              mode="$INPUT_MODE"
+              ;;
+            *) echo "::error::Unknown scheduled flag '$INPUT_SCHEDULED'"; exit 1 ;;
+          esac
+
+          case "$INPUT_REVALIDATE_PLAYERS" in
+            true|'') revalidate_players='true' ;;
+            false) revalidate_players='false' ;;
+            *) echo "::error::Unknown revalidate_players flag '$INPUT_REVALIDATE_PLAYERS'"; exit 1 ;;
           esac
 
           case "$mode" in
@@ -130,7 +144,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
-      group: hourly-sync-guild
+      group: sync-round-guild
       queue: max
       cancel-in-progress: false
     strategy:
@@ -215,7 +229,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     concurrency:
-      group: hourly-sync-player
+      group: sync-round-player
       queue: max
       cancel-in-progress: false
     strategy:
