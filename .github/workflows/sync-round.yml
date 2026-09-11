@@ -5,11 +5,15 @@ on:
   workflow_dispatch:
     inputs:
       scheduled:
-        description: 'Set by the external clock: the standard all-tier incremental round (honours PLAYER_PIPELINE_PAUSED; ignores pipelines / tier / mode)'
-        type: boolean
-        default: false
+        description: "Set by the external clock: 'true' = the standard all-tier incremental round (both pipelines), 'player' = the player-only round; both honour PLAYER_PIPELINE_PAUSED and ignore pipelines / tier / mode"
+        type: choice
+        default: 'false'
+        options:
+          - 'false'
+          - 'true'
+          - 'player'
       revalidate_players:
-        description: 'Rebuild the six players boards after the player sync (the clock passes true on its 2:00 slot only)'
+        description: 'Rebuild the six players boards after the player sync (the clock passes true on the 2:00 main-round slot only)'
         type: boolean
         default: true
       pipelines:
@@ -81,6 +85,15 @@ jobs:
                 paused='true'
               fi
               ;;
+            player)
+              pipelines='player'
+              tier='all'
+              mode='incremental'
+              if [ "${PLAYER_PIPELINE_PAUSED:-}" = 'true' ]; then
+                pipelines='none'
+                paused='true'
+              fi
+              ;;
             false|'')
               pipelines="$INPUT_PIPELINES"
               tier="$INPUT_TIER"
@@ -104,6 +117,7 @@ jobs:
             both) run_guild='true'; run_player='true' ;;
             guild) run_guild='true'; run_player='false' ;;
             player) run_guild='false'; run_player='true' ;;
+            none) run_guild='false'; run_player='false' ;;
             *) echo "::error::Unknown pipelines '$pipelines'"; exit 1 ;;
           esac
 
@@ -127,7 +141,7 @@ jobs:
           esac
 
           if [ "$paused" = 'true' ]; then
-            echo "::notice::Player pipeline PAUSED by vars.PLAYER_PIPELINE_PAUSED — this run syncs guilds only"
+            echo "::notice::Player pipeline PAUSED by vars.PLAYER_PIPELINE_PAUSED — this run syncs guilds only (nothing at all on a player round)"
           fi
           echo "Planned run: pipelines=$pipelines (guild=$run_guild, player=$run_player) tier=$tier mode=$mode revalidate_players=$revalidate_players paused=$paused"
           echo "run_guild=$run_guild" >> "$GITHUB_OUTPUT"
