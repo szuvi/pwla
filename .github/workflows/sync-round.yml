@@ -236,6 +236,15 @@ jobs:
               || echo "Warm-up GET for ${path} failed (ignored)"
           done
 
+      - name: Ping IndexNow for this tier's boards
+        if: success()
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          BOARD_PATH: ${{ matrix.path }}
+          SPEED_PATH: ${{ matrix.speed_path }}
+        run: yarn indexnow:submit --paths "$BOARD_PATH" "$SPEED_PATH"
+
   player:
     name: Player Sync (${{ matrix.tier }})
     needs: [plan, guild]
@@ -320,3 +329,12 @@ jobs:
               "${{ env.DOMAIN_URL }}$path" \
               || echo "Warm-up GET for $path failed (ignored)"
           done
+
+      - name: Ping IndexNow for this tier's players boards
+        if: success() && needs.plan.outputs.revalidate_players == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          PLAYERS_PATH: ${{ matrix.players_path }}
+          PLAYERS_KLASY_PATH: ${{ matrix.players_klasy_path }}
+        run: yarn indexnow:submit --paths "$PLAYERS_PATH" "$PLAYERS_KLASY_PATH"
