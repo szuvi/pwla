@@ -34,12 +34,13 @@ on:
           - tbc
           - mop
       mode:
-        description: 'PLAYER pipeline only: incremental (delta since the watermark) or full (whole history + every board)'
+        description: 'incremental (the clock round) / full (PLAYER only: whole history + every board) / repair (one-off after a rule change: the guild leg re-reconstructs kills for guilds the maxed cheap-out would skip, the player leg re-checks every stored attribution against WCL and re-densifies; dispatch-only, never on a clock round)'
         type: choice
         default: incremental
         options:
           - incremental
           - full
+          - repair
 
 
 jobs:
@@ -109,7 +110,7 @@ jobs:
           esac
 
           case "$mode" in
-            incremental|full) ;;
+            incremental|full|repair) ;;
             *) echo "::error::Unknown mode '$mode'"; exit 1 ;;
           esac
 
@@ -189,7 +190,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24.11.1'
+          node-version: '24.22.1'
           cache: 'yarn'
 
       - name: Cache Prisma Client
@@ -212,7 +213,15 @@ jobs:
         run: yarn sync:guilds --tier ${{ matrix.tier }}
 
       - name: Sync guild progress from Warcraft Logs
-        run: yarn sync:guild-progress-wcl --tier ${{ matrix.tier }}
+        env:
+          MODE: ${{ needs.plan.outputs.mode }}
+          TIER: ${{ matrix.tier }}
+        run: |
+          if [ "$MODE" = 'repair' ]; then
+            yarn sync:guild-progress-wcl --tier "$TIER" --recheck-maxed
+          else
+            yarn sync:guild-progress-wcl --tier "$TIER"
+          fi
 
       - name: Sync guild rankings
         run: yarn sync:guild-rankings --tier ${{ matrix.tier }}
@@ -282,7 +291,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24.11.1'
+          node-version: '24.22.1'
           cache: 'yarn'
 
       - name: Cache Prisma Client
@@ -308,6 +317,8 @@ jobs:
         run: |
           if [ "$MODE" = 'full' ]; then
             yarn sync:player-rankings --tier "$TIER" --full
+          elif [ "$MODE" = 'repair' ]; then
+            yarn sync:player-rankings --tier "$TIER" --reattribute
           else
             yarn sync:player-rankings --tier "$TIER"
           fi
